@@ -2,10 +2,16 @@ from dotenv import load_dotenv
 import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from vector_utils import extract_pdf, extract_ppt, vectorize_texts, vectorize_images
-from db_utils import add_vectors, chroma_vectorstore
+from db_utils import add_text_vectors, add_image_vectors, chroma_vectorstore
 from langchain.chains import RetrievalQA
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 import uuid
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env
 load_dotenv()
@@ -29,20 +35,31 @@ async def upload_file(file: UploadFile = File(...)):
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
 
+        # Filter out empty or None text and table content
+        texts = [text for text in texts if text and text.strip()]
+        tables = [table for table in tables if table and table.strip()]
+        logger.info(f"Filtered text blocks: {len(texts)}, tables: {len(tables)}, images: {len(images)}")
+
         # Vectorize content
         text_vectors = vectorize_texts(texts + tables)
         image_vectors = vectorize_images(images)
 
         # Store in ChromaDB
-        total_vectors = text_vectors + image_vectors
-        if total_vectors:
-            ids = [str(uuid.uuid4()) for _ in total_vectors]
-            metadatas = (
-                [{"source": file.filename, "type": "text"} for _ in texts] +
-                [{"source": file.filename, "type": "table"} for _ in tables] +
-                [{"source": file.filename, "type": "image"} for _ in images]
+        if text_vectors:
+            text_ids = [str(uuid.uuid4()) for _ in text_vectors]
+            text_metadatas = (
+                [{"source": file.filename, "type": "text", "content": text} for text in texts] +
+                [{"source": file.filename, "type": "table", "content": table} for table in tables]
             )
-            add_vectors(total_vectors, metadatas, ids)
+            # Pass the combined texts and tables as documents
+            add_text_vectors(text_vectors, text_metadatas, text_ids, documents=texts + tables)
+            logger.info(f"Stored {len(text_vectors)} text vectors in ChromaDB")
+
+        if image_vectors:
+            image_ids = [str(uuid.uuid4()) for _ in image_vectors]
+            image_metadatas = [{"source": file.filename, "type": "image"} for _ in images]
+            add_image_vectors(image_vectors, image_metadatas, image_ids)
+            logger.info(f"Stored {len(image_vectors)} image vectors in ChromaDB")
 
         return {
             "text_blocks": len(texts),
@@ -55,7 +72,7 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/query")
 async def query_knowledge(query: str):
-    
+    logger.info(f"Processing query: {query}")
     retriever = chroma_vectorstore.as_retriever(search_kwargs={"k": 5})
     qa_chain = RetrievalQA.from_chain_type(
         llm=ChatOpenAI(temperature=0, model_name="gpt-4o-mini"),
@@ -64,7 +81,7 @@ async def query_knowledge(query: str):
     )
 
     # Run query
-    result = qa_chain({"query": query})
+    result = qa_chain.invoke({"query": query})
     answer = result['result']
     source_docs = result['source_documents']
 
@@ -72,8 +89,10 @@ async def query_knowledge(query: str):
     for doc in source_docs:
         sources.append({
             "source_file": doc.metadata.get("source"),
-            "type": doc.metadata.get("type")
+            "type": doc.metadata.get("type"),
+            "content": doc.metadata.get("content") or doc.page_content
         })
+    logger.info(f"Query returned {len(sources)} sources")
 
     return {
         "query": query,
