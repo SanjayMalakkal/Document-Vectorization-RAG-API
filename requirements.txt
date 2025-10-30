@@ -17,3 +17,4 @@ opencv-python==4.10.0.84
 numpy==1.26.4
 pandas==2.2.3
 langchain-community==0.3.3
+python-multipart
